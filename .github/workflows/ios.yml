@@ -1,0 +1,104 @@
+name: Build OpenCode Phone IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      SCHEME: OpenCodePhone
+      PROJECT: OpenCodePhone.xcodeproj
+      APP_NAME: OpenCode
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/xg"
+          rm -rf "$P" "$RUNNER_TEMP/xg.zip"
+          mkdir -p "$P"
+          curl -fsSL -o "$RUNNER_TEMP/xg.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/2.43.0/xcodegen.zip"
+          unzip -q "$RUNNER_TEMP/xg.zip" -d "$RUNNER_TEMP/xgu"
+          bash "$RUNNER_TEMP/xgu/xcodegen/install.sh" "$P"
+          echo "$P/bin" >> "$GITHUB_PATH"
+
+      - name: Generate project
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild -list -project "$PROJECT"
+
+      - name: Compile check
+        run: |
+          set -euo pipefail
+          xcodebuild -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" EXPANDED_CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Archive and package IPA
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/App.xcarchive"
+          rm -rf "$ARCHIVE"
+          xcodebuild archive \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination 'generic/platform=iOS' -sdk iphoneos \
+            -archivePath "$ARCHIVE" \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            MARKETING_VERSION="1.0.0" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" EXPANDED_CODE_SIGN_IDENTITY="" \
+            SKIP_INSTALL=NO ONLY_ACTIVE_ARCH=NO ARCHS=arm64
+
+          APP="$ARCHIVE/Products/Applications/$APP_NAME.app"
+          test -d "$APP" || { echo "no app at $APP"; find "$ARCHIVE" -maxdepth 4 -type d; exit 1; }
+
+          OUT="$RUNNER_TEMP/ipa"
+          rm -rf "$OUT"; mkdir -p "$OUT/Payload"
+          ditto "$APP" "$OUT/Payload/$APP_NAME.app"
+          cd "$OUT"
+          IPA="$RUNNER_TEMP/OpenCode-Phone.ipa"
+          ditto -c -k --norsrc --keepParent Payload "$IPA"
+
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          lipo -archs "$APP/$APP_NAME"
+          ls -lh "$IPA"
+          echo "IPA_PATH=$IPA" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCode-Phone-ipa
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: phone-${{ github.run_number }}
+          name: OpenCode Phone (build ${{ github.run_number }})
+          body: |
+            Нативный SwiftUI-клиент к серверу OpenCode: те же сессии, что на ноутбуке.
+
+            Установка: подписать своим Apple ID через iloader / Sideloadly / SideStore.
+          files: ${{ env.IPA_PATH }}
+          make_latest: true
+          fail_on_unmatched_files: true
