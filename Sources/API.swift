@@ -12,7 +12,7 @@ struct SessionModelRef: Decodable, Hashable {
     let variant: String?
 }
 
-struct SessionTime: Decodable {
+struct SessionTime: Decodable, Hashable {
     let created: Double?
     let updated: Double?
     let idle: Double?
