@@ -110,7 +110,7 @@ final class AppModel: ObservableObject {
         guard let api else { connectionOK = false; return false }
         do {
             let info = try await api.info()
-            serverVersion = info.version
+            serverVersion = info.version ?? ""
             connectionOK = true
             errorText = nil
             events.onEvent = { [weak self] _ in

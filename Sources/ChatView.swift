@@ -198,11 +198,11 @@ struct ToolCard: View {
                     .lineLimit(expanded ? nil : 2)
                     .textSelection(.enabled)
             }
-            if expanded, let out = tool.state?.output, !out.isEmpty {
-                Text(out)
+            if expanded, !tool.state?.resultText.isEmpty {
+                Text(tool.state?.resultText ?? "")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.45))
-                    .lineLimit(40)
+                    .lineLimit(80)
                     .textSelection(.enabled)
             }
         }
@@ -216,9 +216,7 @@ struct ToolCard: View {
     }
 
     private var summary: String {
-        if let c = tool.state?.input?.command { return c }
-        if let p = tool.state?.input?.filePath { return p }
-        return tool.state?.input?.description ?? tool.state?.title ?? ""
+        tool.state?.input?.summary ?? ""
     }
 
     private var icon: String {
