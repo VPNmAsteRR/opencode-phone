@@ -198,7 +198,7 @@ struct ToolCard: View {
                     .lineLimit(expanded ? nil : 2)
                     .textSelection(.enabled)
             }
-            if expanded, !tool.state?.resultText.isEmpty {
+            if expanded, !(tool.state?.resultText.isEmpty ?? true) {
                 Text(tool.state?.resultText ?? "")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.45))
