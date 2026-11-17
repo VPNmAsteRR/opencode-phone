@@ -67,6 +67,8 @@ struct OCMessage: Decodable, Identifiable {
     let content: [OCPart]?
     let agent: String?
     let error: OCErrorPayload?
+    let finish: String?
+    let status: String?
 
     var isUser: Bool { type == "user" }
     var isSystem: Bool { type != "user" && type != "assistant" }

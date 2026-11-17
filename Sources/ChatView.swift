@@ -31,6 +31,16 @@ struct ChatView: View {
                                            subtitle: "Напиши первое сообщение — оно придёт в эту же сессию на ноутбуке.")
                                     .padding(.top, 60)
                             }
+                            if model.agentWorking {
+                                HStack(spacing: 8) {
+                                    ProgressView().tint(.white.opacity(0.5)).scaleEffect(0.8)
+                                    Text("агент работает…")
+                                        .font(.caption)
+                                        .foregroundStyle(.white.opacity(0.45))
+                                    Spacer()
+                                }
+                                .padding(.vertical, 4)
+                            }
                             Color.clear.frame(height: 8).id("BOTTOM")
                         }
                         .padding(.horizontal, 16)
@@ -44,6 +54,11 @@ struct ChatView: View {
                     }
                     .onChange(of: model.messages.last?.id) { _, _ in
                         proxy.scrollTo("BOTTOM", anchor: .bottom)
+                    }
+                    .onChange(of: model.messagesSignature) { _, _ in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("BOTTOM", anchor: .bottom)
+                        }
                     }
                     .task {
                         guard !didLoad else { return }
@@ -73,7 +88,7 @@ struct ChatView: View {
                               systemImage: showReasoning ? "eye.slash" : "eye")
                     }
                     Button {
-                        Task { await model.loadMessages() }
+                        Task { await model.reloadMessages() }
                     } label: {
                         Label("Обновить", systemImage: "arrow.clockwise")
                     }
@@ -282,7 +297,7 @@ struct Composer: View {
     }
 
     private var canSend: Bool {
-        !sending && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 

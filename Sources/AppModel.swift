@@ -29,11 +29,19 @@ struct ConnectionSettings: Codable, Equatable {
 }
 
 // MARK: - Живой поток событий
+//
+// SSE лишь подаёт сигнал «что-то изменилось». Сами данные тянет AppModel,
+// причём с троттлингом — иначе поток событий устраивает шторм запросов.
 
-@MainActor
 final class EventStream {
     private var task: Task<Void, Never>?
-    var onEvent: ((String) -> Void)?
+    private let lock = NSLock()
+    private var signal: (() -> Void)?
+
+    func onSignal(_ handler: @escaping () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        signal = handler
+    }
 
     func start(baseURL: URL, username: String, password: String) {
         stop()
@@ -41,32 +49,52 @@ final class EventStream {
             var attempt = 0
             while !Task.isCancelled {
                 do {
-                    try await self?.consume(baseURL: baseURL, username: username, password: password) {
-                        attempt = 0
-                        self?.onEvent?("tick")
-                    }
+                    try await self?.consume(baseURL: baseURL, username: username, password: password)
+                    attempt = 0
                 } catch {
-                    attempt = min(attempt + 1, 6)
-                    let delay = UInt64(pow(2.0, Double(attempt)) * 1_000_000_000)
+                    if Task.isCancelled { return }
+                    attempt = min(attempt + 1, 5)
+                    let delay = UInt64(pow(1.8, Double(attempt)) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: delay)
                 }
             }
         }
     }
 
-    private func consume(baseURL: URL, username: String, password: String,
-                         onEvent: @escaping () -> Void) async throws {
-        var req = URLRequest(url: baseURL.appendingPathComponent("/api/event"))
+    private func consume(baseURL: URL, username: String, password: String) async throws {
+        var normalized = baseURL.absoluteString
+        if !normalized.hasSuffix("/") { normalized += "/" }
+        guard let url = URL(string: "api/event", relativeTo: URL(string: normalized))?.absoluteURL else {
+            throw OCError.badURL
+        }
+        var req = URLRequest(url: url)
         let raw = "\(username):\(password)".data(using: .utf8) ?? Data()
         req.setValue("Basic " + raw.base64EncodedString(), forHTTPHeaderField: "Authorization")
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         req.timeoutInterval = 3600
 
-        let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 3600
+        cfg.timeoutIntervalForResource = .infinity
+        cfg.waitsForConnectivity = true
+        let s = URLSession(configuration: cfg)
+
+        let (bytes, resp) = try await s.bytes(for: req)
         if let http = resp as? HTTPURLResponse, http.statusCode == 401 { throw OCError.unauthorized }
+
+        var lastSignal = Date.distantPast
         for try await line in bytes.lines {
             if Task.isCancelled { return }
-            if line.hasPrefix("data:") { onEvent() }
+            guard line.hasPrefix("data:") else { continue }
+            let now = Date()
+            // не чаще 8 раз в секунду
+            if now.timeIntervalSince(lastSignal) < 0.12 { continue }
+            lastSignal = now
+            lock.lock()
+            let handler = signal
+            lock.unlock()
+            handler?()
         }
     }
 
@@ -89,11 +117,34 @@ final class AppModel: ObservableObject {
     @Published var errorText: String?
     @Published var connectionOK = false
     @Published var serverVersion = ""
+    @Published var agentWorking = false
+
+    /// Подпись содержимого переписки — по ней SwiftUI понимает, что текст изменился
+    @Published private(set) var messagesSignature: String = ""
 
     let events = EventStream()
     private var api: OpenCodeAPI?
+    private var refreshTask: Task<Void, Never>?
+    private var pendingRefresh = false
+    private var refreshing = false
+    private var lastSessionsFetch = Date.distantPast
 
-    var currentSessionID: String?
+    var currentSessionID: String? {
+        didSet { if oldValue != currentSessionID { resetStream() } }
+    }
+
+    private func resetStream() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        guard let sid = currentSessionID else { return }
+        refreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                if Task.isCancelled { return }
+                await self?.refreshSession(sid, quiet: true)
+            }
+        }
+    }
 
     func rebuildClient() {
         guard let url = settings.url, settings.isValid else {
@@ -113,8 +164,8 @@ final class AppModel: ObservableObject {
             serverVersion = info.version ?? ""
             connectionOK = true
             errorText = nil
-            events.onEvent = { [weak self] _ in
-                Task { @MainActor in await self?.refreshQuietly() }
+            events.onSignal { [weak self] in
+                Task { @MainActor in self?.scheduleRefresh() }
             }
             if let url = settings.url {
                 events.start(baseURL: url, username: settings.username, password: settings.password)
@@ -128,49 +179,123 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func loadSessions() async {
+    // MARK: Список сессий
+
+    func loadSessions(quiet: Bool = false) async {
         guard let api else { return }
-        loadingSessions = true
-        defer { loadingSessions = false }
+        if !quiet { loadingSessions = true }
+        defer { if !quiet { loadingSessions = false } }
         do {
             sessions = try await api.sessions()
-            errorText = nil
+            lastSessionsFetch = Date()
+            if errorText != nil { errorText = nil }
         } catch {
-            errorText = error.localizedDescription
+            if !quiet { errorText = error.localizedDescription }
         }
     }
+
+    // MARK: Сессия и сообщения
 
     func openSession(_ session: OCSession) async {
-        currentSessionID = session.id
-        await loadMessages()
-    }
-
-    func loadMessages() async {
-        guard let api, let sid = currentSessionID else { return }
-        loadingMessages = true
-        defer { loadingMessages = false }
-        do {
-            messages = try await api.messages(sessionID: sid)
-            errorText = nil
-        } catch {
-            errorText = error.localizedDescription
+        if currentSessionID != session.id {
+            messages = []
+            messagesSignature = ""
+            currentSessionID = session.id
         }
+        loadingMessages = messages.isEmpty
+        await refreshSession(session.id, quiet: false)
+        loadingMessages = false
     }
 
-    /// Тихая догрузка по событию SSE
-    private func refreshQuietly() async {
-        guard let api else { return }
-        if let sid = currentSessionID {
-            if let fresh = try? await api.messages(sessionID: sid),
-               fresh.count != messages.count || fresh.last?.id != messages.last?.id {
-                messages = fresh
+    /// Дебаунс обновлений от SSE
+    private var debounceTask: Task<Void, Never>?
+
+    private func scheduleRefresh() {
+        if refreshing { pendingRefresh = true; return }
+        debounceTask?.cancel()
+        debounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            if let sid = self.currentSessionID {
+                await self.refreshSession(sid, quiet: true)
+            }
+            if Date().timeIntervalSince(self.lastSessionsFetch) > 3 {
+                await self.loadSessions(quiet: true)
             }
         }
-        if let list = try? await api.sessions(), list != sessions {
-            sessions = list
+    }
+
+    /// Тянет сообщения сессии. Не запускается параллельно самой себя.
+    func refreshSession(_ sid: String, quiet: Bool) async {
+        guard let api else { return }
+        if refreshing { pendingRefresh = true; return }
+        refreshing = true
+        defer {
+            refreshing = false
+            if pendingRefresh {
+                pendingRefresh = false
+                scheduleRefresh()
+            }
+        }
+        do {
+            let fresh = try await api.messages(sessionID: sid)
+            guard sid == currentSessionID else { return }
+            apply(fresh)
+            if !quiet, errorText != nil { errorText = nil }
+        } catch {
+            if !quiet { errorText = error.localizedDescription }
         }
     }
 
+    private func apply(_ fresh: [OCMessage]) {
+        let sig = AppModel.signature(of: fresh)
+        if sig == messagesSignature { return }
+        messages = fresh
+        messagesSignature = sig
+
+        if let last = fresh.last {
+            if last.isUser {
+                agentWorking = true
+            } else if last.type == "assistant" {
+                let fin = last.finish ?? last.status
+                agentWorking = (fin == nil || fin?.isEmpty == true)
+            } else {
+                agentWorking = false
+            }
+        } else {
+            agentWorking = false
+        }
+    }
+
+    /// Отпечаток переписки: id + объём текста каждой части.
+    /// Ловит и новые сообщения, и рост текста внутри уже существующих.
+    nonisolated static func signature(of msgs: [OCMessage]) -> String {
+        var parts: [String] = []
+        parts.reserveCapacity(msgs.count * 2)
+        for m in msgs {
+            var n = m.id.count + (m.text?.count ?? 0)
+            for c in m.content ?? [] {
+                n += c.type.count + (c.text?.count ?? 0) + (c.name?.count ?? 0)
+                if let s = c.state {
+                    n += (s.status?.count ?? 0) + s.resultText.count
+                }
+            }
+            parts.append("\(m.id)#\(n)")
+        }
+        return parts.joined(separator: "|")
+    }
+
+    func reloadMessages() async {
+        if let sid = currentSessionID {
+            await refreshSession(sid, quiet: false)
+        }
+    }
+
+    // MARK: Отправка
+
+    /// Возвращает управление сразу после того, как сервер принял сообщение.
+    /// Ответ агента подтягивается опросом/SSE — интерфейс не блокируется.
     func send(_ text: String) async -> Bool {
         guard let api, let sid = currentSessionID else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -180,13 +305,8 @@ final class AppModel: ObservableObject {
         do {
             try await api.sendPrompt(sessionID: sid, text: trimmed)
             errorText = nil
-            // показываем отправленное сразу, затем подтянем ответ
-            await loadMessages()
-            for _ in 0..<60 {
-                try? await Task.sleep(nanoseconds: 700_000_000)
-                await loadMessages()
-                if let last = messages.last, !last.isUser, !last.displayText.isEmpty { break }
-            }
+            agentWorking = true
+            await refreshSession(sid, quiet: true)
             return true
         } catch {
             errorText = error.localizedDescription
@@ -198,7 +318,7 @@ final class AppModel: ObservableObject {
         guard let api else { return nil }
         do {
             let s = try await api.createSession(title: title, directory: directory)
-            await loadSessions()
+            await loadSessions(quiet: true)
             return s
         } catch {
             errorText = error.localizedDescription
@@ -209,5 +329,11 @@ final class AppModel: ObservableObject {
     func projects() async -> [OCProject] {
         guard let api else { return [] }
         return (try? await api.projects()) ?? []
+    }
+
+    func stopEvents() {
+        events.stop()
+        refreshTask?.cancel()
+        refreshTask = nil
     }
 }
